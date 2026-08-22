@@ -1,0 +1,97 @@
+name: "Mint Tenant Token"
+description: >-
+  Mints a short-lived GCP token for a tenant's service account by running
+  this repo's cmd/mint-token locally in the calling job - no deployed
+  Cloud Function involved. Uses whatever Application Default Credentials
+  the calling job already has (typically Workload Identity Federation as
+  huram-abi's `terraform` service account). That identity must hold
+  roles/iam.serviceAccountTokenCreator on minter-service-account (see
+  terraform/token-minter's minter_impersonators variable), and
+  minter-service-account must in turn hold it on target-service-account
+  (see the tenants variable) - this action supplies minter-service-account
+  as the delegate in that chain, so the calling identity never needs a
+  direct grant on target-service-account itself.
+inputs:
+  target-service-account:
+    description: "Email of the tenant service account to mint a token for"
+    required: true
+  minter-service-account:
+    description: >-
+      Email of the token-minter service account (terraform output:
+      token_minter_service_account) to delegate through. Leave blank only
+      if the calling identity has been granted
+      roles/iam.serviceAccountTokenCreator directly on
+      target-service-account instead.
+    required: false
+    default: ""
+  kind:
+    description: '"access" or "id"'
+    required: false
+    default: "access"
+  scopes:
+    description: "Comma-separated OAuth scopes (access tokens only)"
+    required: false
+    default: "https://www.googleapis.com/auth/cloud-platform"
+  audience:
+    description: >-
+      Audience (id tokens only, required when kind is "id") - typically
+      the tenant's Cloud Function/Cloud Run URL, since that's what its
+      built-in authentication checks an ID token's audience against.
+    required: false
+    default: ""
+  lifetime:
+    description: "Access token lifetime (access tokens only), Go duration syntax"
+    required: false
+    default: "10m"
+  ref:
+    description: "Branch/tag/commit of xd-dash/atman to run cmd/mint-token from"
+    required: false
+    default: "main"
+
+outputs:
+  token:
+    description: "The minted token"
+    value: ${{ steps.mint.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out atman
+      uses: actions/checkout@v4
+      with:
+        repository: xd-dash/atman
+        ref: ${{ inputs.ref }}
+        path: mint-token-atman
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: mint-token-atman/go.mod
+
+    - name: Mint token
+      id: mint
+      shell: bash
+      working-directory: mint-token-atman
+      run: |
+        set -euo pipefail
+
+        args=(
+          -target "${{ inputs.target-service-account }}"
+          -kind "${{ inputs.kind }}"
+          -scopes "${{ inputs.scopes }}"
+          -lifetime "${{ inputs.lifetime }}"
+        )
+
+        if [ -n "${{ inputs.minter-service-account }}" ]; then
+          args+=(-delegate "${{ inputs.minter-service-account }}")
+        fi
+
+        if [ -n "${{ inputs.audience }}" ]; then
+          args+=(-audience "${{ inputs.audience }}")
+        fi
+
+        token="$(go run ./cmd/mint-token "${args[@]}" 2>mint.log)"
+        cat mint.log >&2
+
+        echo "::add-mask::$token"
+        echo "token=$token" >> "$GITHUB_OUTPUT"
