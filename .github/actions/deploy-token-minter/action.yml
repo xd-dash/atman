@@ -1,0 +1,239 @@
+name: "Deploy token-minter Cloud Function"
+description: >-
+  Checks out this repo and dash-xd/gospace-minimal, points the latter's
+  router drop-in at this repo's router package, and deploys the result as
+  a GCP Cloud Function (gen2) via terraform/token-minter, using whatever
+  GCP identity is already authenticated in the calling job. Meant to be
+  called remotely - e.g. from xd-dash/huram-abi's own
+  deploy-token-minter.yml workflow - so this repo owns its own deploy
+  logic instead of huram-abi needing a copy of it.
+inputs:
+  project_id:
+    description: "GCP project ID"
+    required: true
+  region:
+    description: "GCP region for the Cloud Function"
+    required: false
+    default: "us-central1"
+  function_name:
+    description: "Cloud Function name"
+    required: false
+    default: "token-minter"
+  minter_service_account_id:
+    description: "Account ID (local part of the email) for the token-minter service account"
+    required: false
+    default: "token-minter"
+  min_instances:
+    description: "Minimum concurrent instances to keep warm"
+    required: false
+    default: "0"
+  max_instances:
+    description: "Maximum concurrent instances for the deployed function"
+    required: false
+    default: "10"
+  runtime:
+    description: >-
+      Cloud Functions Go runtime identifier (e.g. "go126"). Rotates on
+      Google's decommission schedule - see terraform/token-minter's
+      runtime variable description for how to find the current one if
+      deploy fails with DEPLOYS_NOT_ALLOWED.
+    required: false
+    default: "go126"
+  gospace_minimal_ref:
+    description: "Branch/tag/commit of dash-xd/gospace-minimal to deploy"
+    required: false
+    default: "main"
+  atman_ref:
+    description: "Branch/tag/commit of this repo to deploy the router and terraform module from"
+    required: false
+    default: "main"
+  tenants_json:
+    description: >-
+      JSON object mapping tenant_id -> {service_account_email,
+      create_service_account, function_name, function_generation,
+      api_key}, matching terraform/token-minter's `tenants` variable.
+      Typically sourced from a repo/org secret in the calling workflow.
+      Defaults to "{}" (no tenants provisioned - just the minter identity
+      and the function).
+    required: false
+    default: "{}"
+  minter_impersonators:
+    description: >-
+      Comma-separated IAM members allowed to impersonate the token-minter
+      service account directly, e.g.
+      "serviceAccount:terraform@PROJECT.iam.gserviceaccount.com" - so the
+      mint-token action can mint tenant tokens locally in CI. Leave blank
+      for none.
+    required: false
+    default: ""
+  state_backend:
+    description: >-
+      Where to store this module's Terraform state: "gcs" (default, Cloud
+      Storage) or "cache" (actions/cache - no locking, only switch once
+      that tradeoff is fine).
+    required: false
+    default: "gcs"
+  state_bucket:
+    description: "GCS bucket to store this module's Terraform state in. Required when state_backend is \"gcs\"."
+    required: false
+  apply:
+    description: "Set to \"true\" to apply after planning; otherwise this only plans."
+    required: false
+    default: "false"
+
+outputs:
+  function_url:
+    description: "HTTPS trigger URL for the deployed token-minter function (apply only)"
+    value: ${{ steps.outputs.outputs.function_url }}
+  token_minter_service_account:
+    description: "Email of the deployed token-minter service account (apply only)"
+    value: ${{ steps.outputs.outputs.token_minter_service_account }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out this repo's router + terraform module
+      uses: actions/checkout@v4
+      with:
+        repository: xd-dash/atman
+        ref: ${{ inputs.atman_ref }}
+        path: token-minter-atman
+
+    - name: Check out gospace-minimal
+      uses: actions/checkout@v4
+      with:
+        repository: dash-xd/gospace-minimal
+        ref: ${{ inputs.gospace_minimal_ref }}
+        path: token-minter-shell
+
+    # A dropped-in source.go often imports a package (here,
+    # github.com/xd-dash/atman/router) at whatever commit atman_ref
+    # resolved to - go mod tidy inside the router action below needs to
+    # actually reach github.com to resolve that, which requires this
+    # instead of the default module proxy if the repo is private.
+    - name: Allow Go modules to resolve github.com/xd-dash directly
+      shell: bash
+      run: echo "GOPRIVATE=github.com/xd-dash/*" >> "$GITHUB_ENV"
+
+    # Points gospace-minimal's router drop-in at this repo's router
+    # package via a small shim that just calls router.NewRouter() - the
+    # actual routing/handler logic lives entirely in this repo's router/
+    # and internal/ packages, never inlined here.
+    - name: Point gospace-minimal at this repo's router
+      uses: dash-xd/gospace-minimal/.github/actions/router@main
+      with:
+        source-content: |
+          package source
+
+          import (
+            "net/http"
+
+            atmanrouter "github.com/xd-dash/atman/router"
+          )
+
+          func NewRouter() http.Handler {
+            return atmanrouter.NewRouter()
+          }
+        build: "false"
+        working-directory: token-minter-shell
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: "1.9.8"
+
+    - name: Restore Terraform state from cache
+      if: ${{ inputs.state_backend == 'cache' }}
+      uses: actions/cache@v5
+      with:
+        path: token-minter-atman/terraform/token-minter/terraform.tfstate
+        key: tfstate-token-minter-${{ github.run_id }}
+        restore-keys: |
+          tfstate-token-minter-
+
+    - name: Switch to local backend for cached state
+      if: ${{ inputs.state_backend == 'cache' }}
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: |
+        cat > backend_override.tf <<'EOF'
+        terraform {
+          backend "local" {}
+        }
+        EOF
+
+    - name: Terraform init (GCS backend)
+      if: ${{ inputs.state_backend != 'cache' }}
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ inputs.state_bucket }}" \
+          -backend-config="prefix=terraform/token-minter"
+
+    - name: Terraform init (local backend, cached)
+      if: ${{ inputs.state_backend == 'cache' }}
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: terraform init -reconfigure
+
+    - name: Terraform validate
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: terraform validate
+
+    # Written to a tfvars file (rather than -var) since tenants is a
+    # complex, sensitive, arbitrarily-sized structure - passing it through
+    # a shell -var argument risks both escaping bugs and leaking it into
+    # process listings/logs.
+    - name: Write generated tfvars
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      env:
+        TENANTS_JSON: ${{ inputs.tenants_json }}
+        MINTER_IMPERSONATORS: ${{ inputs.minter_impersonators }}
+      run: |
+        set -euo pipefail
+
+        jq -n --argjson tenants "$TENANTS_JSON" '{tenants: $tenants}' \
+          > generated.auto.tfvars.json
+
+        jq -n --arg csv "$MINTER_IMPERSONATORS" '
+          { minter_impersonators:
+            ( $csv
+              | split(",")
+              | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+              | map(select(length > 0))
+            )
+          }' > minter_impersonators.auto.tfvars.json
+
+    - name: Terraform plan
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: |
+        terraform plan \
+          -var="project_id=${{ inputs.project_id }}" \
+          -var="region=${{ inputs.region }}" \
+          -var="function_name=${{ inputs.function_name }}" \
+          -var="minter_service_account_id=${{ inputs.minter_service_account_id }}" \
+          -var="min_instances=${{ inputs.min_instances }}" \
+          -var="max_instances=${{ inputs.max_instances }}" \
+          -var="runtime=${{ inputs.runtime }}" \
+          -var="source_dir=${{ github.workspace }}/token-minter-shell" \
+          -out=tfplan
+
+    - name: Terraform apply
+      if: ${{ inputs.apply == 'true' }}
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: terraform apply -auto-approve tfplan
+
+    - name: Read outputs
+      id: outputs
+      if: ${{ inputs.apply == 'true' }}
+      shell: bash
+      working-directory: token-minter-atman/terraform/token-minter
+      run: |
+        terraform output
+        echo "function_url=$(terraform output -raw function_url)" >> "$GITHUB_OUTPUT"
+        echo "token_minter_service_account=$(terraform output -raw token_minter_service_account)" >> "$GITHUB_OUTPUT"
