@@ -20,6 +20,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go mod download
+      - name: Resolve module metadata
+        run: |
+          go mod tidy
+          cat go.mod
       - run: go test ./...
       - run: docker build -t atman:test .
