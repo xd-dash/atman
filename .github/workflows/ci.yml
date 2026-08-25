@@ -20,9 +20,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Resolve module checksums
-        run: |
-          go mod tidy
-          cat go.sum
+      - run: go mod download
       - run: go test ./...
       - run: docker build -t atman:test .
