@@ -20,5 +20,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - run: go mod download
       - run: go test ./...
       - run: docker build -t atman:test .
