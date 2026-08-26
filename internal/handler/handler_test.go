@@ -13,12 +13,12 @@ import (
 )
 
 type fakeMinter struct {
-	token           string
-	err             error
-	target          string
-	audience        string
-	includeEmail    bool
-	delegateCount   int
+	token         string
+	err           error
+	target        string
+	audience      string
+	includeEmail  bool
+	delegateCount int
 }
 
 func (f *fakeMinter) IDToken(_ context.Context, target, audience string, includeEmail bool, delegates ...string) (string, error) {
