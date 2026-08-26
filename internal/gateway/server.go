@@ -44,11 +44,27 @@ type Config struct {
 	MaxBodyBytes          int64
 }
 
-type server struct {
-	cfg      Config
-	verifier Verifier
-	kms      KMS
+type TenantRoute struct {
+	TenantID  string
+	Audiences []string
+	Callers   []string
+	KMS       KMS
 }
+
+type MultiConfig struct {
+	MaxBodyBytes int64
+	Routes       []TenantRoute
+}
+
+type server struct {
+	cfg       Config
+	verifier  Verifier
+	kms       KMS
+	routes    []TenantRoute
+	healthKMS []KMS
+}
+
+type kmsContextKey struct{}
 
 func New(cfg Config, verifier Verifier, kms KMS) (http.Handler, error) {
 	if cfg.Audience == "" || cfg.AllowedServiceAccount == "" {
@@ -60,13 +76,59 @@ func New(cfg Config, verifier Verifier, kms KMS) (http.Handler, error) {
 	if verifier == nil || kms == nil {
 		return nil, errors.New("verifier and KMS are required")
 	}
-	s := &server{cfg: cfg, verifier: verifier, kms: kms}
+	s := &server{cfg: cfg, verifier: verifier, kms: kms, healthKMS: []KMS{kms}}
+	return s.handler(s.authorize), nil
+}
+
+func NewMulti(cfg MultiConfig, verifier Verifier) (http.Handler, error) {
+	if cfg.MaxBodyBytes < 1 {
+		return nil, errors.New("max body bytes must be positive")
+	}
+	if verifier == nil {
+		return nil, errors.New("verifier is required")
+	}
+	if len(cfg.Routes) == 0 {
+		return nil, errors.New("at least one tenant route is required")
+	}
+	seen := make(map[string]string)
+	health := make([]KMS, 0, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		if route.TenantID == "" || len(route.Audiences) == 0 || len(route.Callers) == 0 || route.KMS == nil {
+			return nil, errors.New("tenant route requires tenant id, audiences, callers, and KMS")
+		}
+		for _, audience := range route.Audiences {
+			if audience == "" {
+				return nil, errors.New("tenant route audience is empty")
+			}
+			for _, caller := range route.Callers {
+				if caller == "" {
+					return nil, errors.New("tenant route caller is empty")
+				}
+				key := audience + "\x00" + caller
+				if existing, ok := seen[key]; ok && existing != route.TenantID {
+					return nil, errors.New("ambiguous audience and caller mapping")
+				}
+				seen[key] = route.TenantID
+			}
+		}
+		health = append(health, route.KMS)
+	}
+	s := &server{
+		cfg:       Config{MaxBodyBytes: cfg.MaxBodyBytes},
+		verifier:  verifier,
+		routes:    cfg.Routes,
+		healthKMS: health,
+	}
+	return s.handler(s.authorizeMulti), nil
+}
+
+func (s *server) handler(authorize func(http.HandlerFunc) http.HandlerFunc) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("POST /v1/keys/{key}/encrypt", s.authorize(s.encrypt))
-	mux.HandleFunc("POST /v1/keys/{key}/decrypt", s.authorize(s.decrypt))
-	mux.HandleFunc("POST /v1/keys/{key}/generate-data-key", s.authorize(s.generateDataKey))
-	return securityHeaders(mux), nil
+	mux.HandleFunc("POST /v1/keys/{key}/encrypt", authorize(s.encrypt))
+	mux.HandleFunc("POST /v1/keys/{key}/decrypt", authorize(s.decrypt))
+	mux.HandleFunc("POST /v1/keys/{key}/generate-data-key", authorize(s.generateDataKey))
+	return securityHeaders(mux)
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -78,14 +140,22 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func bearerToken(r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") || len(header) <= 7 {
+		return "", false
+	}
+	return header[7:], true
+}
+
 func (s *server) authorize(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		if !strings.HasPrefix(header, "Bearer ") || len(header) <= 7 {
+		token, ok := bearerToken(r)
+		if !ok {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		payload, err := s.verifier.Validate(r.Context(), header[7:], s.cfg.Audience)
+		payload, err := s.verifier.Validate(r.Context(), token, s.cfg.Audience)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "invalid identity token")
 			return
@@ -98,6 +168,87 @@ func (s *server) authorize(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func (s *server) authorizeMulti(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearerToken(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "missing bearer token")
+			return
+		}
+		audiences, err := unverifiedAudiences(token)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "invalid identity token")
+			return
+		}
+		for _, audience := range audiences {
+			for _, route := range s.routes {
+				if !contains(route.Audiences, audience) {
+					continue
+				}
+				payload, err := s.verifier.Validate(r.Context(), token, audience)
+				if err != nil {
+					continue
+				}
+				email, _ := payload.Claims["email"].(string)
+				verified, _ := payload.Claims["email_verified"].(bool)
+				if !verified || !contains(route.Callers, email) {
+					continue
+				}
+				ctx := context.WithValue(r.Context(), kmsContextKey{}, route.KMS)
+				next(w, r.WithContext(ctx))
+				return
+			}
+		}
+		writeError(w, http.StatusForbidden, "service account is not authorized")
+	}
+}
+
+func unverifiedAudiences(token string) ([]string, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, errors.New("malformed JWT")
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil, err
+	}
+	switch aud := claims["aud"].(type) {
+	case string:
+		if aud == "" {
+			return nil, errors.New("empty audience")
+		}
+		return []string{aud}, nil
+	case []any:
+		values := make([]string, 0, len(aud))
+		for _, value := range aud {
+			text, ok := value.(string)
+			if !ok || text == "" {
+				return nil, errors.New("invalid audience")
+			}
+			values = append(values, text)
+		}
+		if len(values) == 0 {
+			return nil, errors.New("empty audience")
+		}
+		return values, nil
+	default:
+		return nil, errors.New("missing audience")
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 type dataRequest struct {
@@ -139,12 +290,19 @@ func (s *server) decode(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	return data, true
 }
 
+func (s *server) kmsForRequest(r *http.Request) KMS {
+	if selected, ok := r.Context().Value(kmsContextKey{}).(KMS); ok && selected != nil {
+		return selected
+	}
+	return s.kms
+}
+
 func (s *server) encrypt(w http.ResponseWriter, r *http.Request) {
 	data, ok := s.decode(w, r)
 	if !ok {
 		return
 	}
-	result, err := s.kms.Encrypt(r.Context(), r.PathValue("key"), data)
+	result, err := s.kmsForRequest(r).Encrypt(r.Context(), r.PathValue("key"), data)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "marai encryption failed")
 		return
@@ -157,7 +315,7 @@ func (s *server) decrypt(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.kms.Decrypt(r.Context(), r.PathValue("key"), data)
+	result, err := s.kmsForRequest(r).Decrypt(r.Context(), r.PathValue("key"), data)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "decryption failed")
 		return
@@ -170,7 +328,7 @@ func (s *server) generateDataKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "request body must be empty")
 		return
 	}
-	plaintext, wrapped, err := s.kms.GenerateDataKey(r.Context(), r.PathValue("key"))
+	plaintext, wrapped, err := s.kmsForRequest(r).GenerateDataKey(r.Context(), r.PathValue("key"))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "data-key generation failed")
 		return
@@ -182,9 +340,11 @@ func (s *server) generateDataKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
-	if err := s.kms.Ping(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "marai unavailable")
-		return
+	for _, kms := range s.healthKMS {
+		if err := kms.Ping(r.Context()); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "marai unavailable")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
