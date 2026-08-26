@@ -69,8 +69,21 @@ func validTenantID(value string) bool {
 }
 
 func validServiceAccountEmail(value string) bool {
-	local, found := strings.CutSuffix(value, serviceAccountSuffix)
-	return found && local != "" && !strings.ContainsAny(local, "@/ ")
+	accountID, domain, found := strings.Cut(value, "@")
+	projectID, hasSuffix := strings.CutSuffix(domain, serviceAccountSuffix)
+	return found && hasSuffix && validIAMName(accountID) && validIAMName(projectID)
+}
+
+func validIAMName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateAudience(value string) error {
