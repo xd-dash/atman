@@ -11,12 +11,12 @@ import (
 )
 
 type fakeVerifier struct {
-	payload *Payload
-	err     error
+	principal Principal
+	err       error
 }
 
-func (v fakeVerifier) Validate(context.Context, string, string) (*Payload, error) {
-	return v.payload, v.err
+func (v fakeVerifier) Verify(context.Context, string, string) (Principal, error) {
+	return v.principal, v.err
 }
 
 type fakeKMS struct{}
@@ -35,9 +35,9 @@ func (fakeKMS) Ping(context.Context) error { return nil }
 func newTestHandler(t *testing.T, verifier Verifier) http.Handler {
 	t.Helper()
 	handler, err := New(Config{
-		Audience:              "https://atman.example",
-		AllowedServiceAccount: "tenant@example.iam.gserviceaccount.com",
-		MaxBodyBytes:          1024,
+		Audience:         "kms://tenant",
+		AllowedPrincipal: "ed25519:tenant-key",
+		MaxBodyBytes:     1024,
 	}, verifier, fakeKMS{})
 	if err != nil {
 		t.Fatal(err)
@@ -56,13 +56,14 @@ func request(t *testing.T, handler http.Handler, method, path, token, body strin
 	return rec
 }
 
-func TestAuthorization(t *testing.T) {
-	allowed := fakeVerifier{payload: &Payload{Claims: map[string]any{
-		"email":          "tenant@example.iam.gserviceaccount.com",
-		"email_verified": true,
-	}}}
+func TestAuthorizationUsesNormalizedPrincipal(t *testing.T) {
+	allowed := fakeVerifier{principal: Principal{
+		ID:       "ed25519:tenant-key",
+		Issuer:   "local-test",
+		Audience: "kms://tenant",
+	}}
 	body := `{"data":"` + base64.StdEncoding.EncodeToString([]byte("secret")) + `"}`
-	if got := request(t, newTestHandler(t, allowed), http.MethodPost, "/v1/keys/key-1/encrypt", "token", body); got.Code != http.StatusOK {
+	if got := request(t, newTestHandler(t, allowed), http.MethodPost, "/v1/keys/key-1/encrypt", "credential", body); got.Code != http.StatusOK {
 		t.Fatalf("allowed request status=%d body=%s", got.Code, got.Body.String())
 	}
 
@@ -72,14 +73,10 @@ func TestAuthorization(t *testing.T) {
 		token    string
 		status   int
 	}{
-		{"missing token", allowed, "", http.StatusUnauthorized},
-		{"invalid token", fakeVerifier{err: errors.New("invalid")}, "bad", http.StatusUnauthorized},
-		{"wrong service account", fakeVerifier{payload: &Payload{Claims: map[string]any{
-			"email": "other@example.iam.gserviceaccount.com", "email_verified": true,
-		}}}, "token", http.StatusForbidden},
-		{"unverified email", fakeVerifier{payload: &Payload{Claims: map[string]any{
-			"email": "tenant@example.iam.gserviceaccount.com", "email_verified": false,
-		}}}, "token", http.StatusForbidden},
+		{"missing credential", allowed, "", http.StatusUnauthorized},
+		{"invalid credential", fakeVerifier{err: errors.New("invalid")}, "bad", http.StatusUnauthorized},
+		{"wrong principal", fakeVerifier{principal: Principal{ID: "ed25519:other", Audience: "kms://tenant"}}, "credential", http.StatusForbidden},
+		{"wrong audience", fakeVerifier{principal: Principal{ID: "ed25519:tenant-key", Audience: "kms://other"}}, "credential", http.StatusForbidden},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -92,12 +89,10 @@ func TestAuthorization(t *testing.T) {
 }
 
 func TestRequestValidation(t *testing.T) {
-	allowed := fakeVerifier{payload: &Payload{Claims: map[string]any{
-		"email": "tenant@example.iam.gserviceaccount.com", "email_verified": true,
-	}}}
+	allowed := fakeVerifier{principal: Principal{ID: "ed25519:tenant-key", Audience: "kms://tenant"}}
 	handler := newTestHandler(t, allowed)
 	for _, body := range []string{`{"data":"%%%"}`, `{"data":"YQ==","extra":true}`, `{}`, `not-json`} {
-		got := request(t, handler, http.MethodPost, "/v1/keys/key/encrypt", "token", body)
+		got := request(t, handler, http.MethodPost, "/v1/keys/key/encrypt", "credential", body)
 		if got.Code != http.StatusBadRequest {
 			t.Fatalf("body=%q status=%d response=%s", body, got.Code, got.Body.String())
 		}
@@ -105,10 +100,8 @@ func TestRequestValidation(t *testing.T) {
 }
 
 func TestGenerateDataKey(t *testing.T) {
-	allowed := fakeVerifier{payload: &Payload{Claims: map[string]any{
-		"email": "tenant@example.iam.gserviceaccount.com", "email_verified": true,
-	}}}
-	got := request(t, newTestHandler(t, allowed), http.MethodPost, "/v1/keys/key/generate-data-key", "token", "")
+	allowed := fakeVerifier{principal: Principal{ID: "ed25519:tenant-key", Audience: "kms://tenant"}}
+	got := request(t, newTestHandler(t, allowed), http.MethodPost, "/v1/keys/key/generate-data-key", "credential", "")
 	if got.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", got.Code, got.Body.String())
 	}

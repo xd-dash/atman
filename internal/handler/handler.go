@@ -6,7 +6,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/xd-dash/atman/internal/mint"
+	"github.com/xd-dash/atman/internal/googlemint"
 	"github.com/xd-dash/atman/internal/tenant"
 )
 
@@ -19,7 +19,7 @@ type Minter interface {
 type liveMinter struct{}
 
 func (liveMinter) IDToken(ctx context.Context, serviceAccount, audience string, includeEmail bool, delegates ...string) (string, error) {
-	return mint.IDToken(ctx, serviceAccount, audience, includeEmail, delegates...)
+	return googlemint.IDToken(ctx, serviceAccount, audience, includeEmail, delegates...)
 }
 
 type tokenRequest struct {

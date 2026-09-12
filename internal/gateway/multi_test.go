@@ -3,21 +3,20 @@ package gateway
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"testing"
 )
 
 type audienceVerifier struct {
-	claimsByAudience map[string]map[string]any
+	principalsByAudience map[string]Principal
 }
 
-func (v audienceVerifier) Validate(_ context.Context, _ string, audience string) (*Payload, error) {
-	claims, ok := v.claimsByAudience[audience]
+func (v audienceVerifier) Verify(_ context.Context, _ string, audience string) (Principal, error) {
+	principal, ok := v.principalsByAudience[audience]
 	if !ok {
-		return nil, context.Canceled
+		return Principal{}, context.Canceled
 	}
-	return &Payload{Claims: claims}, nil
+	return principal, nil
 }
 
 type markingKMS struct{ marker string }
@@ -33,32 +32,16 @@ func (m markingKMS) GenerateDataKey(context.Context, string) ([]byte, []byte, er
 }
 func (markingKMS) Ping(context.Context) error { return nil }
 
-func unsignedJWT(t *testing.T, audience string) string {
-	t.Helper()
-	encode := func(v any) string {
-		data, err := json.Marshal(v)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return base64.RawURLEncoding.EncodeToString(data)
-	}
-	return encode(map[string]any{"alg": "none"}) + "." + encode(map[string]any{"aud": audience}) + ".x"
-}
-
-func TestMultiTenantRoutingUsesIdentityClaims(t *testing.T) {
-	verifier := audienceVerifier{claimsByAudience: map[string]map[string]any{
-		"https://security.internal/logma": {
-			"email": "logma@dashxd.iam.gserviceaccount.com", "email_verified": true,
-		},
-		"https://security.internal/agni": {
-			"email": "agni@dashxd.iam.gserviceaccount.com", "email_verified": true,
-		},
+func TestMultiTenantRoutingUsesNormalizedPrincipal(t *testing.T) {
+	verifier := audienceVerifier{principalsByAudience: map[string]Principal{
+		"kms://logma": {ID: "spiffe://xd.run/farcaster/logma", Issuer: "spiffe://xd.run", Audience: "kms://logma"},
+		"kms://agni":  {ID: "ed25519:agni-host", Issuer: "local-ed25519", Audience: "kms://agni"},
 	}}
 	handler, err := NewMulti(MultiConfig{
 		MaxBodyBytes: 1024,
 		Routes: []TenantRoute{
-			{TenantID: "logma", Audiences: []string{"https://security.internal/logma"}, Callers: []string{"logma@dashxd.iam.gserviceaccount.com"}, KMS: markingKMS{marker: "logma"}},
-			{TenantID: "agni", Audiences: []string{"https://security.internal/agni"}, Callers: []string{"agni@dashxd.iam.gserviceaccount.com"}, KMS: markingKMS{marker: "agni"}},
+			{TenantID: "logma", Audiences: []string{"kms://logma"}, Principals: []string{"spiffe://xd.run/farcaster/logma"}, KMS: markingKMS{marker: "logma"}},
+			{TenantID: "agni", Audiences: []string{"kms://agni"}, Principals: []string{"ed25519:agni-host"}, KMS: markingKMS{marker: "agni"}},
 		},
 	}, verifier)
 	if err != nil {
@@ -69,10 +52,10 @@ func TestMultiTenantRoutingUsesIdentityClaims(t *testing.T) {
 		audience string
 		marker   string
 	}{
-		{"https://security.internal/logma", "logma:secret"},
-		{"https://security.internal/agni", "agni:secret"},
+		{"kms://logma", "logma:secret"},
+		{"kms://agni", "agni:secret"},
 	} {
-		got := request(t, handler, http.MethodPost, "/v1/keys/key/encrypt", unsignedJWT(t, test.audience), body)
+		got := request(t, handler, http.MethodPost, "/v1/keys/key/encrypt", "opaque-credential", body)
 		if got.Code != http.StatusOK {
 			t.Fatalf("audience=%s status=%d body=%s", test.audience, got.Code, got.Body.String())
 		}
@@ -80,29 +63,50 @@ func TestMultiTenantRoutingUsesIdentityClaims(t *testing.T) {
 		if !containsString(got.Body.String(), want) {
 			t.Fatalf("audience=%s response=%s want encoded marker=%s", test.audience, got.Body.String(), want)
 		}
+		delete(verifier.principalsByAudience, test.audience)
 	}
 }
 
-func TestMultiTenantCannotSelectTenantByPath(t *testing.T) {
-	verifier := audienceVerifier{claimsByAudience: map[string]map[string]any{
-		"https://security.internal/logma": {
-			"email": "other@dashxd.iam.gserviceaccount.com", "email_verified": true,
-		},
+func TestMultiTenantRejectsUnknownPrincipal(t *testing.T) {
+	verifier := audienceVerifier{principalsByAudience: map[string]Principal{
+		"kms://logma": {ID: "spiffe://xd.run/farcaster/other", Audience: "kms://logma"},
 	}}
 	handler, err := NewMulti(MultiConfig{
 		MaxBodyBytes: 1024,
 		Routes: []TenantRoute{{
-			TenantID: "logma",
-			Audiences: []string{"https://security.internal/logma"},
-			Callers: []string{"logma@dashxd.iam.gserviceaccount.com"},
-			KMS: markingKMS{marker: "logma"},
+			TenantID:   "logma",
+			Audiences:  []string{"kms://logma"},
+			Principals: []string{"spiffe://xd.run/farcaster/logma"},
+			KMS:        markingKMS{marker: "logma"},
 		}},
 	}, verifier)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := `{"data":"YQ=="}`
-	got := request(t, handler, http.MethodPost, "/v1/tenants/logma/keys/key/encrypt", unsignedJWT(t, "https://security.internal/logma"), body)
+	got := request(t, handler, http.MethodPost, "/v1/keys/key/encrypt", "opaque-credential", body)
+	if got.Code != http.StatusForbidden {
+		t.Fatalf("unknown principal must be forbidden: status=%d body=%s", got.Code, got.Body.String())
+	}
+}
+
+func TestMultiTenantCannotSelectTenantByPath(t *testing.T) {
+	verifier := audienceVerifier{principalsByAudience: map[string]Principal{
+		"kms://logma": {ID: "spiffe://xd.run/farcaster/logma", Audience: "kms://logma"},
+	}}
+	handler, err := NewMulti(MultiConfig{
+		MaxBodyBytes: 1024,
+		Routes: []TenantRoute{{
+			TenantID:   "logma",
+			Audiences:  []string{"kms://logma"},
+			Principals: []string{"spiffe://xd.run/farcaster/logma"},
+			KMS:        markingKMS{marker: "logma"},
+		}},
+	}, verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := request(t, handler, http.MethodPost, "/v1/tenants/logma/keys/key/encrypt", "opaque-credential", `{"data":"YQ=="}`)
 	if got.Code != http.StatusNotFound {
 		t.Fatalf("tenant-selecting path must not exist: status=%d body=%s", got.Code, got.Body.String())
 	}
