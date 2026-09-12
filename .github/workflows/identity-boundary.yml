@@ -5,7 +5,10 @@ on:
     branches: [main]
     paths:
       - 'cmd/atman/**'
+      - 'cmd/mint-token/**'
       - 'internal/gateway/**'
+      - 'internal/googlemint/**'
+      - 'internal/handler/**'
       - 'internal/identity/**'
       - 'internal/tenantregistry/**'
       - '.github/workflows/identity-boundary.yml'
@@ -25,9 +28,9 @@ jobs:
           go-version-file: go.mod
           cache: false
       - run: go mod download
-      - name: Check formatting for the identity boundary
-        run: test -z "$(gofmt -l cmd/atman internal/gateway internal/identity internal/tenantregistry)"
-      - name: Vet identity boundary
-        run: go vet ./cmd/atman ./internal/gateway ./internal/identity/... ./internal/tenantregistry
-      - name: Test identity boundary
-        run: go test ./cmd/atman ./internal/gateway ./internal/identity/... ./internal/tenantregistry
+      - name: Check formatting for identity and Google compatibility boundaries
+        run: test -z "$(gofmt -l cmd/atman cmd/mint-token internal/gateway internal/googlemint internal/handler internal/identity internal/tenantregistry)"
+      - name: Vet identity and Google compatibility boundaries
+        run: go vet ./cmd/atman ./cmd/mint-token ./internal/gateway ./internal/googlemint ./internal/handler ./internal/identity/... ./internal/tenantregistry
+      - name: Test identity and Google compatibility boundaries
+        run: go test ./cmd/atman ./cmd/mint-token ./internal/gateway ./internal/googlemint ./internal/handler ./internal/identity/... ./internal/tenantregistry
