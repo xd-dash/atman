@@ -12,23 +12,36 @@ import (
 	"cloud.google.com/go/auth/credentials/idtoken"
 )
 
-type Payload struct {
-	Expires int64
-	Claims  map[string]any
+type Principal struct {
+	ID       string
+	Issuer   string
+	Audience string
+	Claims   map[string]any
 }
 
 type Verifier interface {
-	Validate(context.Context, string, string) (*Payload, error)
+	Verify(context.Context, string, string) (Principal, error)
 }
 
 type GoogleVerifier struct{}
 
-func (GoogleVerifier) Validate(ctx context.Context, token, audience string) (*Payload, error) {
+func (GoogleVerifier) Verify(ctx context.Context, token, audience string) (Principal, error) {
 	payload, err := idtoken.Validate(ctx, token, audience)
 	if err != nil {
-		return nil, err
+		return Principal{}, err
 	}
-	return &Payload{Expires: payload.Expires, Claims: payload.Claims}, nil
+	email, _ := payload.Claims["email"].(string)
+	verified, _ := payload.Claims["email_verified"].(bool)
+	if email == "" || !verified {
+		return Principal{}, errors.New("google identity has no verified email")
+	}
+	issuer, _ := payload.Claims["iss"].(string)
+	return Principal{
+		ID:       "gcp-sa:" + email,
+		Issuer:   issuer,
+		Audience: audience,
+		Claims:   payload.Claims,
+	}, nil
 }
 
 type KMS interface {
@@ -39,16 +52,16 @@ type KMS interface {
 }
 
 type Config struct {
-	Audience              string
-	AllowedServiceAccount string
-	MaxBodyBytes          int64
+	Audience         string
+	AllowedPrincipal string
+	MaxBodyBytes     int64
 }
 
 type TenantRoute struct {
-	TenantID  string
-	Audiences []string
-	Callers   []string
-	KMS       KMS
+	TenantID   string
+	Audiences  []string
+	Principals []string
+	KMS        KMS
 }
 
 type MultiConfig struct {
@@ -67,8 +80,8 @@ type server struct {
 type kmsContextKey struct{}
 
 func New(cfg Config, verifier Verifier, kms KMS) (http.Handler, error) {
-	if cfg.Audience == "" || cfg.AllowedServiceAccount == "" {
-		return nil, errors.New("audience and allowed service account are required")
+	if cfg.Audience == "" || cfg.AllowedPrincipal == "" {
+		return nil, errors.New("audience and allowed principal are required")
 	}
 	if cfg.MaxBodyBytes < 1 {
 		return nil, errors.New("max body bytes must be positive")
@@ -93,20 +106,20 @@ func NewMulti(cfg MultiConfig, verifier Verifier) (http.Handler, error) {
 	seen := make(map[string]string)
 	health := make([]KMS, 0, len(cfg.Routes))
 	for _, route := range cfg.Routes {
-		if route.TenantID == "" || len(route.Audiences) == 0 || len(route.Callers) == 0 || route.KMS == nil {
-			return nil, errors.New("tenant route requires tenant id, audiences, callers, and KMS")
+		if route.TenantID == "" || len(route.Audiences) == 0 || len(route.Principals) == 0 || route.KMS == nil {
+			return nil, errors.New("tenant route requires tenant id, audiences, principals, and KMS")
 		}
 		for _, audience := range route.Audiences {
 			if audience == "" {
 				return nil, errors.New("tenant route audience is empty")
 			}
-			for _, caller := range route.Callers {
-				if caller == "" {
-					return nil, errors.New("tenant route caller is empty")
+			for _, principal := range route.Principals {
+				if principal == "" {
+					return nil, errors.New("tenant route principal is empty")
 				}
-				key := audience + "\x00" + caller
+				key := audience + "\x00" + principal
 				if existing, ok := seen[key]; ok && existing != route.TenantID {
-					return nil, errors.New("ambiguous audience and caller mapping")
+					return nil, errors.New("ambiguous audience and principal mapping")
 				}
 				seen[key] = route.TenantID
 			}
@@ -155,15 +168,13 @@ func (s *server) authorize(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		payload, err := s.verifier.Validate(r.Context(), token, s.cfg.Audience)
+		principal, err := s.verifier.Verify(r.Context(), token, s.cfg.Audience)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "invalid identity token")
+			writeError(w, http.StatusUnauthorized, "invalid identity credential")
 			return
 		}
-		email, _ := payload.Claims["email"].(string)
-		verified, _ := payload.Claims["email_verified"].(bool)
-		if !verified || email != s.cfg.AllowedServiceAccount {
-			writeError(w, http.StatusForbidden, "service account is not authorized")
+		if principal.Audience != s.cfg.Audience || principal.ID != s.cfg.AllowedPrincipal {
+			writeError(w, http.StatusForbidden, "principal is not authorized")
 			return
 		}
 		next(w, r)
@@ -177,23 +188,10 @@ func (s *server) authorizeMulti(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		audiences, err := unverifiedAudiences(token)
-		if err != nil {
-			writeError(w, http.StatusUnauthorized, "invalid identity token")
-			return
-		}
-		for _, audience := range audiences {
-			for _, route := range s.routes {
-				if !contains(route.Audiences, audience) {
-					continue
-				}
-				payload, err := s.verifier.Validate(r.Context(), token, audience)
-				if err != nil {
-					continue
-				}
-				email, _ := payload.Claims["email"].(string)
-				verified, _ := payload.Claims["email_verified"].(bool)
-				if !verified || !contains(route.Callers, email) {
+		for _, route := range s.routes {
+			for _, audience := range route.Audiences {
+				principal, err := s.verifier.Verify(r.Context(), token, audience)
+				if err != nil || principal.Audience != audience || !contains(route.Principals, principal.ID) {
 					continue
 				}
 				ctx := context.WithValue(r.Context(), kmsContextKey{}, route.KMS)
@@ -201,44 +199,7 @@ func (s *server) authorizeMulti(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
-		writeError(w, http.StatusForbidden, "service account is not authorized")
-	}
-}
-
-func unverifiedAudiences(token string) ([]string, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return nil, errors.New("malformed JWT")
-	}
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, err
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
-		return nil, err
-	}
-	switch aud := claims["aud"].(type) {
-	case string:
-		if aud == "" {
-			return nil, errors.New("empty audience")
-		}
-		return []string{aud}, nil
-	case []any:
-		values := make([]string, 0, len(aud))
-		for _, value := range aud {
-			text, ok := value.(string)
-			if !ok || text == "" {
-				return nil, errors.New("invalid audience")
-			}
-			values = append(values, text)
-		}
-		if len(values) == 0 {
-			return nil, errors.New("empty audience")
-		}
-		return values, nil
-	default:
-		return nil, errors.New("missing audience")
+		writeError(w, http.StatusForbidden, "principal is not authorized")
 	}
 }
 
