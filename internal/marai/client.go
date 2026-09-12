@@ -68,9 +68,32 @@ func (c *Client) GenerateDataKey(ctx context.Context, key string) ([]byte, []byt
 	return plaintext, wrapped, nil
 }
 
+// Ping is Atman's readiness probe for the cryptographic authority, not merely
+// Redis process liveness. A quiesced, exported, dead, or bootstrap-only Marai
+// process must not keep the HTTP gateway ready for application traffic.
 func (c *Client) Ping(ctx context.Context) error {
-	_, err := c.call(ctx, "PING")
-	return err
+	reply, err := c.call(ctx, "KMS.STATUS")
+	if err != nil {
+		return err
+	}
+	values, ok := reply.([]any)
+	if !ok || len(values) != 5 {
+		return errors.New("unexpected marai status reply")
+	}
+	state, ok := values[0].(string)
+	if !ok {
+		if raw, rawOK := values[0].([]byte); rawOK {
+			state = string(raw)
+			ok = true
+		}
+	}
+	if !ok || state != "active" {
+		if state == "" {
+			state = "unknown"
+		}
+		return fmt.Errorf("marai authority is %s", state)
+	}
+	return nil
 }
 
 func bulk(reply any, err error) ([]byte, error) {
