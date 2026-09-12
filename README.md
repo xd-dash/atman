@@ -7,7 +7,31 @@ Atman is the Google IAM boundary for [marai](https://github.com/xd-dash/marai). 
 1. Single-tenant compatibility mode validates one exact audience and one exact caller service-account email, then calls one colocated marai process over its Unix socket.
 2. Registry mode loads a deployment-controlled tenant registry and resolves `(validated audience, verified service-account email)` to a tenant-local marai client. The HTTP request never chooses a tenant ID or Unix socket.
 
-Atman never exposes Redis, Redis credentials, or marai key-administration operations over HTTP. Key creation and rotation remain on the instance's local administrative boundary.
+Atman never exposes Redis, Redis credentials, marai key administration, or marai lifecycle transitions over HTTP. Key creation, rotation, quiesce, export/import, and zeroization remain on the instance's local administrative/lifecycle boundary.
+
+## Marai authority lifecycle
+
+Atman treats a running Redis process and an active cryptographic authority as different health properties. Its Marai readiness probe uses `KMS.STATUS`; application traffic is ready only while Marai reports `active`. A bootstrap-only, quiesced, exported, or dead Marai therefore makes `GET /healthz` fail even if Redis itself still answers connections.
+
+This keeps lifecycle control outside the network gateway:
+
+```text
+Huram / local lifecycle authority
+        |
+        | create / rotate / quiesce / export / zeroize
+        v
+      Marai
+        ^
+        | application-only Redis identity
+        |
+      Atman
+        ^
+        | authenticated HTTP
+        |
+    workload
+```
+
+Graceful draining is an orchestration concern. The intended terminal sequence is to stop admitting new application traffic at the outer boundary, wait for in-flight work, and only then transition Marai from `ACTIVE` to `QUIESCED`. Atman does not expose a remote unquiesce/resume path.
 
 ## Marai gateway
 
