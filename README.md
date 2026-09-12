@@ -176,7 +176,7 @@ There is intentionally no `/v1/tenants/{tenant}/...` route. Shared-host deployme
 
 The repository still contains Google-specific compatibility tooling, but it is separate from gateway authorization semantics.
 
-`internal/mint`, `cmd/mint-token`, the deployed token-minter, and `terraform/token-minter` call or configure Google IAM Credentials APIs. They exist for WIF/service-account deployments and integration tests; the Ed25519 gateway path does not require those components or GCP IAM service accounts.
+`internal/googlemint`, `cmd/mint-token`, the deployed token-minter, and `terraform/token-minter` call or configure Google IAM Credentials APIs. They exist for WIF/service-account deployments and integration tests; the Ed25519 gateway path does not require those components or GCP IAM service accounts.
 
 This distinction is deliberate:
 
@@ -231,6 +231,6 @@ The audience remains mandatory regardless of identity provider. Principal answer
 - `internal/identity/ed25519`: local/provider-independent signed-token adapter.
 - `internal/marai`: Marai application client/readiness.
 - `internal/tenantregistry`: trusted audience/principal-to-Marai routing policy.
-- `cmd/mint-token`, `internal/mint`, `router`, `internal/handler`, `internal/tenant`, `terraform/token-minter`: Google-specific token-minting compatibility path.
+- `cmd/mint-token`, `internal/googlemint`, `router`, `internal/handler`, `internal/tenant`, `terraform/token-minter`: Google-specific token-minting compatibility path.
 
 Run `go test ./...` for unit tests. Exact Atman + Marai integration remains staged in `huram-abi-master`, where deployment policy and protected credentials belong.
