@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,6 +21,21 @@ func signedCredential(t *testing.T, privateKey ed25519.PrivateKey, payload crede
 	signed := []byte(credentialVersion + "." + encoded)
 	signature := ed25519.Sign(privateKey, signed)
 	return credentialVersion + "." + encoded + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+func tamperSignature(t *testing.T, credential string) string {
+	t.Helper()
+	parts := strings.Split(credential, ".")
+	if len(parts) != 3 {
+		t.Fatalf("unexpected credential shape: %q", credential)
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature[0] ^= 0x01
+	parts[2] = base64.RawURLEncoding.EncodeToString(signature)
+	return strings.Join(parts, ".")
 }
 
 func TestVerifierNormalizesTrustedPrincipal(t *testing.T) {
@@ -84,7 +100,7 @@ func TestVerifierRejectsWrongAudienceTamperAndExpiry(t *testing.T) {
 		t.Fatal("expected audience mismatch")
 	}
 
-	tampered := valid[:len(valid)-1] + "A"
+	tampered := tamperSignature(t, valid)
 	if _, err := verifier.Verify(context.Background(), tampered, "kms://world-17"); err == nil {
 		t.Fatal("expected tampered credential rejection")
 	}
