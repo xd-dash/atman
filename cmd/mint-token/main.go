@@ -1,17 +1,11 @@
-// Command mint-token mints a short-lived GCP token for a target service
-// account by calling internal/mint directly - the same package the
-// deployed HTTP handler (router/) uses, so "how a token gets minted" is
-// implemented exactly once whether it's exercised over HTTP or run
-// standalone.
+// Command mint-token mints a short-lived Google token for a target service
+// account by calling internal/googlemint directly - the same package the
+// deployed HTTP token-minter handler uses. This command is Google-specific
+// compatibility tooling and is not part of Atman's provider-neutral gateway.
 //
-// It uses whatever Application Default Credentials the process already
-// has. That identity needs roles/iam.serviceAccountTokenCreator on
-// -target, either directly or via the -delegate chain (see
-// terraform/token-minter's minter_impersonators, which is what grants a
-// CI identity that permission on the token-minter service account
-// itself). This is what .github/actions/mint-token wraps to let other
-// workflows - in this repo or elsewhere, such as huram-abi's - mint a
-// tenant token locally without going through the deployed function.
+// It uses whatever Application Default Credentials the process already has.
+// That identity needs roles/iam.serviceAccountTokenCreator on -target, either
+// directly or via the -delegate chain.
 package main
 
 import (
@@ -22,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xd-dash/atman/internal/mint"
+	"github.com/xd-dash/atman/internal/googlemint"
 )
 
 func main() {
@@ -55,13 +49,11 @@ func main() {
 		if *scopesFlag != "" {
 			scopes = strings.Split(*scopesFlag, ",")
 		}
-
-		token, expiresAt, err := mint.AccessToken(ctx, *target, scopes, *lifetime, delegates...)
+		token, expiresAt, err := googlemint.AccessToken(ctx, *target, scopes, *lifetime, delegates...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mint-token: %v\n", err)
 			os.Exit(1)
 		}
-
 		fmt.Println(token)
 		fmt.Fprintf(os.Stderr, "expires_at=%s\n", expiresAt.Format(time.RFC3339))
 
@@ -70,13 +62,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "mint-token: -audience is required for -kind=id")
 			os.Exit(2)
 		}
-
-		token, err := mint.IDToken(ctx, *target, *audience, *includeEmail, delegates...)
+		token, err := googlemint.IDToken(ctx, *target, *audience, *includeEmail, delegates...)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mint-token: %v\n", err)
 			os.Exit(1)
 		}
-
 		fmt.Println(token)
 
 	default:
