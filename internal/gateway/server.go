@@ -9,40 +9,11 @@ import (
 	"net/http"
 	"strings"
 
-	"cloud.google.com/go/auth/credentials/idtoken"
+	"github.com/xd-dash/atman/internal/identity"
 )
 
-type Principal struct {
-	ID       string
-	Issuer   string
-	Audience string
-	Claims   map[string]any
-}
-
-type Verifier interface {
-	Verify(context.Context, string, string) (Principal, error)
-}
-
-type GoogleVerifier struct{}
-
-func (GoogleVerifier) Verify(ctx context.Context, token, audience string) (Principal, error) {
-	payload, err := idtoken.Validate(ctx, token, audience)
-	if err != nil {
-		return Principal{}, err
-	}
-	email, _ := payload.Claims["email"].(string)
-	verified, _ := payload.Claims["email_verified"].(bool)
-	if email == "" || !verified {
-		return Principal{}, errors.New("google identity has no verified email")
-	}
-	issuer, _ := payload.Claims["iss"].(string)
-	return Principal{
-		ID:       "gcp-sa:" + email,
-		Issuer:   issuer,
-		Audience: audience,
-		Claims:   payload.Claims,
-	}, nil
-}
+type Principal = identity.Principal
+type Verifier = identity.Verifier
 
 type KMS interface {
 	Encrypt(context.Context, string, []byte) ([]byte, error)
