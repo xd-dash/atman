@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,26 +42,47 @@ func allowedPrincipal() string {
 }
 
 func identityVerifier() (identity.Verifier, error) {
-	provider := os.Getenv("ATMAN_IDENTITY_PROVIDER")
-	if provider == "" {
-		provider = "google"
+	configured := os.Getenv("ATMAN_IDENTITY_PROVIDERS")
+	if configured == "" {
+		configured = os.Getenv("ATMAN_IDENTITY_PROVIDER")
 	}
-	switch provider {
-	case "google":
-		return googleidentity.Verifier{}, nil
-	case "ed25519":
-		path := os.Getenv("ATMAN_ED25519_KEYS_FILE")
-		if path == "" {
-			return nil, errors.New("ATMAN_ED25519_KEYS_FILE is required for ed25519 identity")
-		}
-		verifier, err := ed25519identity.Load(path)
-		if err != nil {
-			return nil, err
-		}
-		return verifier, nil
-	default:
-		return nil, fmt.Errorf("unsupported ATMAN_IDENTITY_PROVIDER %q", provider)
+	if configured == "" {
+		configured = "google"
 	}
+
+	providers := strings.Split(configured, ",")
+	chain := make(identity.Chain, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	for _, raw := range providers {
+		provider := strings.TrimSpace(raw)
+		if provider == "" {
+			return nil, errors.New("ATMAN_IDENTITY_PROVIDERS contains an empty provider")
+		}
+		if _, ok := seen[provider]; ok {
+			continue
+		}
+		seen[provider] = struct{}{}
+		switch provider {
+		case "google":
+			chain = append(chain, googleidentity.Verifier{})
+		case "ed25519":
+			path := os.Getenv("ATMAN_ED25519_KEYS_FILE")
+			if path == "" {
+				return nil, errors.New("ATMAN_ED25519_KEYS_FILE is required for ed25519 identity")
+			}
+			verifier, err := ed25519identity.Load(path)
+			if err != nil {
+				return nil, err
+			}
+			chain = append(chain, verifier)
+		default:
+			return nil, fmt.Errorf("unsupported Atman identity provider %q", provider)
+		}
+	}
+	if len(chain) == 1 {
+		return chain[0], nil
+	}
+	return chain, nil
 }
 
 func maxBodyBytes() int64 {
