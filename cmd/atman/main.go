@@ -26,6 +26,16 @@ func required(name string) string {
 	return value
 }
 
+func allowedPrincipal() string {
+	if principal := os.Getenv("ATMAN_ALLOWED_PRINCIPAL"); principal != "" {
+		return principal
+	}
+	if serviceAccount := os.Getenv("ATMAN_ALLOWED_SERVICE_ACCOUNT"); serviceAccount != "" {
+		return "gcp-sa:" + serviceAccount
+	}
+	return ""
+}
+
 func maxBodyBytes() int64 {
 	value := int64(8 << 20)
 	if configured := os.Getenv("ATMAN_MAX_BODY_BYTES"); configured != "" {
@@ -58,10 +68,10 @@ func buildHandler() (http.Handler, error) {
 				return nil, errors.New("configure marai client for tenant " + tenantID + ": " + err.Error())
 			}
 			routes = append(routes, gateway.TenantRoute{
-				TenantID:  tenantID,
-				Audiences: tenant.Audiences,
-				Callers:   tenant.Callers,
-				KMS:       kms,
+				TenantID:   tenantID,
+				Audiences:  tenant.Audiences,
+				Principals: tenant.EffectivePrincipals(),
+				KMS:        kms,
 			})
 		}
 		return gateway.NewMulti(gateway.MultiConfig{
@@ -79,10 +89,14 @@ func buildHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	principal := allowedPrincipal()
+	if principal == "" {
+		return nil, errors.New("ATMAN_ALLOWED_PRINCIPAL is required (ATMAN_ALLOWED_SERVICE_ACCOUNT remains a Google compatibility alias)")
+	}
 	return gateway.New(gateway.Config{
-		Audience:              required("ATMAN_AUDIENCE"),
-		AllowedServiceAccount: required("ATMAN_ALLOWED_SERVICE_ACCOUNT"),
-		MaxBodyBytes:          maxBody,
+		Audience:         required("ATMAN_AUDIENCE"),
+		AllowedPrincipal: principal,
+		MaxBodyBytes:     maxBody,
 	}, gateway.GoogleVerifier{}, kms)
 }
 
